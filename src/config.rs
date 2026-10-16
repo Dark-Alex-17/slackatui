@@ -304,17 +304,20 @@ impl Config {
         Ok(())
     }
 
-    /// Create a default config file at the given path and return the default config.
-    fn create_default_file(path: &Path) -> Result<Self, ConfigError> {
+    /// Serialise to pretty JSON and write to `path`, creating parent dirs.
+    pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| ConfigError::Io(e.to_string()))?;
         }
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|e| ConfigError::InvalidJson(e.to_string()))?;
+        fs::write(path, json).map_err(|e| ConfigError::Io(e.to_string()))
+    }
 
+    /// Create a default config file at the given path and return the default config.
+    fn create_default_file(path: &Path) -> Result<Self, ConfigError> {
         let cfg = Config::default();
-        let json = serde_json::to_string_pretty(&cfg)
-            .map_err(|e| ConfigError::Io(e.to_string()))?;
-        fs::write(path, json).map_err(|e| ConfigError::Io(e.to_string()))?;
-
+        cfg.save(path)?;
         Ok(cfg)
     }
 }
@@ -602,22 +605,9 @@ pub fn run_config_wizard() {
         },
     };
 
-    // Write
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-
-    match serde_json::to_string_pretty(&cfg) {
-        Ok(json) => {
-            if let Err(e) = fs::write(&path, &json) {
-                eprintln!("\n  \x1b[1;31mError saving config:\x1b[0m {}", e);
-                return;
-            }
-        }
-        Err(e) => {
-            eprintln!("\n  \x1b[1;31mError serializing config:\x1b[0m {}", e);
-            return;
-        }
+    if let Err(e) = cfg.save(&path) {
+        eprintln!("\n  \x1b[1;31mError saving config:\x1b[0m {}", e);
+        return;
     }
 
     println!();
@@ -757,6 +747,19 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(err, ConfigError::InvalidJson(_)));
+    }
+
+    #[test]
+    fn test_save_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("config");
+
+        let mut cfg = Config::default();
+        cfg.auth.team_id = "T123".to_string();
+        cfg.save(&path).unwrap();
+
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.auth.team_id, "T123");
     }
 
     #[test]

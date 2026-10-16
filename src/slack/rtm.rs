@@ -3,6 +3,8 @@ use serde::Deserialize;
 use tokio::sync::mpsc;
 use tokio::time::{self, Duration};
 use tokio_tungstenite::tungstenite;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::header::COOKIE;
 use tracing::warn;
 
 use super::SlackClient;
@@ -124,7 +126,8 @@ async fn run_rtm_connection(
     let url = rtm_resp.url;
 
     // Connect
-    let (ws_stream, _) = tokio_tungstenite::connect_async(&url).await?;
+    let request = ws_request(&url, client.cookie_header())?;
+    let (ws_stream, _) = tokio_tungstenite::connect_async(request).await?;
     let (mut ws_write, mut ws_read) = ws_stream.split();
 
     let _ = tx.send(RtmEvent::Connected);
@@ -213,9 +216,38 @@ fn parse_rtm_event(text: &str) -> Option<RtmEvent> {
     }
 }
 
+/// The WebSocket handshake request for `url`, carrying the session cookie when one is set.
+fn ws_request(
+    url: &str,
+    cookie_header: Option<String>,
+) -> Result<tungstenite::handshake::client::Request, Box<dyn std::error::Error + Send + Sync>> {
+    let mut request = url.into_client_request()?;
+    if let Some(cookie) = cookie_header {
+        request.headers_mut().insert(COOKIE, cookie.parse()?);
+    }
+    Ok(request)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_ws_request_with_cookie() {
+        let request = ws_request(
+            "wss://wss-primary.slack.com/link/?ticket=x",
+            Some("d=xoxd-y".to_string()),
+        )
+        .unwrap();
+        assert_eq!(request.headers().get("cookie").unwrap(), "d=xoxd-y");
+        assert!(request.headers().get("host").is_some());
+    }
+
+    #[test]
+    fn test_ws_request_without_cookie() {
+        let request = ws_request("wss://wss-primary.slack.com/link/?ticket=x", None).unwrap();
+        assert!(request.headers().get("cookie").is_none());
+    }
 
     #[test]
     fn test_parse_message_event() {

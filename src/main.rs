@@ -9,7 +9,7 @@ mod slack;
 mod tui;
 mod types;
 
-use auth::{load_tokens, store_tokens, StoreType};
+use auth::{load_tokens, store_tokens, tokens_from_env, StoreType};
 use config::Config;
 use service::SlackService;
 use slack::SlackClient;
@@ -54,12 +54,15 @@ fn main() {
         }
     };
 
-    let tokens = match load_tokens(&cfg.auth.team_id, &store_type) {
-        Ok(t) => t,
-        Err(_) => {
-            eprintln!("No stored tokens found. Run `slackatui auth` first to authenticate.");
-            std::process::exit(1);
-        }
+    let tokens = match tokens_from_env() {
+        Some(t) => t,
+        None => match load_tokens(&cfg.auth.team_id, &store_type) {
+            Ok(t) => t,
+            Err(_) => {
+                eprintln!("No stored tokens found. Run `slackatui auth` first to authenticate.");
+                std::process::exit(1);
+            }
+        },
     };
 
     // Pick the token to use based on preference
@@ -73,7 +76,8 @@ fn main() {
         }
     };
 
-    let client = SlackClient::new(token);
+    let cookie = (!tokens.cookie.is_empty()).then_some(tokens.cookie.as_str());
+    let client = SlackClient::with_cookie(token, cookie);
     let svc = SlackService::new(client, cfg.emoji);
 
     // Run the TUI with the tokio runtime

@@ -3,8 +3,43 @@ use std::collections::HashMap;
 use chrono::{DateTime, Local, TimeZone};
 
 use crate::parse;
-use crate::slack::{Conversation, SlackClient, SlackMessage};
+use crate::slack::{Conversation, SlackClient, SlackError, SlackMessage};
 use crate::types::{AttachedFile, ChannelItem, ChannelType, Message, Reaction};
+
+/// Slack refused the stored token or cookie; the user has to sign in again.
+#[derive(Debug)]
+pub struct CredentialsRejected {
+    code: String,
+}
+
+impl std::fmt::Display for CredentialsRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Slack rejected the stored credentials ({}). Run `slackatui login` (browser session) or `slackatui auth` (Slack app) to sign in again.",
+            self.code
+        )
+    }
+}
+
+impl std::error::Error for CredentialsRejected {}
+
+fn is_auth_error_code(code: &str) -> bool {
+    matches!(
+        code,
+        "invalid_auth" | "not_authed" | "token_revoked" | "token_expired" | "account_inactive"
+    )
+}
+
+/// Turn an auth-class API failure into `CredentialsRejected`; pass anything else through.
+pub fn describe_init_error(err: SlackError) -> Box<dyn std::error::Error> {
+    match err {
+        SlackError::Api(code) if is_auth_error_code(&code) => {
+            Box::new(CredentialsRejected { code })
+        }
+        other => Box::new(other),
+    }
+}
 
 /// High-level service that wraps the Slack API client and manages
 /// user/bot caches, channel lists, and message creation.
@@ -29,11 +64,15 @@ impl SlackService {
 
     /// Initialize the service: validate token, load user cache.
     pub async fn init(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let auth = self.client.auth_test().await?;
+        let auth = self.client.auth_test().await.map_err(describe_init_error)?;
         self.current_user_id = auth.user_id;
         self.current_team = auth.team;
 
-        self.user_cache = self.client.get_users().await?;
+        self.user_cache = self
+            .client
+            .get_users()
+            .await
+            .map_err(describe_init_error)?;
         Ok(())
     }
 
@@ -370,6 +409,46 @@ mod tests {
         svc.user_cache.insert("U2".into(), "bob".into());
         svc.user_cache.insert("B1".into(), "testbot".into());
         svc
+    }
+
+    // ---- describe_init_error ----
+
+    #[test]
+    fn test_describe_init_error_auth_code() {
+        let err = describe_init_error(SlackError::Api("token_revoked".to_string()));
+        assert_eq!(
+            err.to_string(),
+            "Slack rejected the stored credentials (token_revoked). Run `slackatui login` (browser session) or `slackatui auth` (Slack app) to sign in again."
+        );
+
+        for code in [
+            "invalid_auth",
+            "not_authed",
+            "token_revoked",
+            "token_expired",
+            "account_inactive",
+        ] {
+            let err = describe_init_error(SlackError::Api(code.to_string()));
+            assert!(
+                err.downcast_ref::<CredentialsRejected>().is_some(),
+                "{} should map to CredentialsRejected",
+                code
+            );
+        }
+    }
+
+    #[test]
+    fn test_describe_init_error_other_api_code_passes_through() {
+        let err = describe_init_error(SlackError::Api("channel_not_found".to_string()));
+        assert_eq!(err.to_string(), "Slack API error: channel_not_found");
+        assert!(err.downcast_ref::<CredentialsRejected>().is_none());
+    }
+
+    #[test]
+    fn test_describe_init_error_http_passes_through() {
+        let err = describe_init_error(SlackError::Http("timeout".to_string()));
+        assert_eq!(err.to_string(), "Slack HTTP error: timeout");
+        assert!(err.downcast_ref::<CredentialsRejected>().is_none());
     }
 
     // ---- conversation_to_channel ----

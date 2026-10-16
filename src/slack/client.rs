@@ -28,19 +28,40 @@ impl std::error::Error for SlackError {}
 pub struct SlackClient {
     http: Client,
     token: String,
+    cookie: Option<String>,
 }
 
 impl SlackClient {
     pub fn new(token: &str) -> Self {
+        Self::with_cookie(token, None)
+    }
+
+    /// Build a client that also sends a Slack `d=` session cookie (needed for xoxc tokens).
+    pub fn with_cookie(token: &str, cookie: Option<&str>) -> Self {
         Self {
             http: Client::new(),
             token: token.to_string(),
+            cookie: cookie.filter(|c| !c.is_empty()).map(str::to_string),
         }
     }
 
     /// Return the token (used for creating RTM client clone).
     pub fn token(&self) -> &str {
         &self.token
+    }
+
+    /// Cookie header value for the session cookie, if one is set.
+    /// The raw value is passed through unencoded; Slack issues it already percent-encoded.
+    pub fn cookie_header(&self) -> Option<String> {
+        self.cookie.as_ref().map(|c| format!("d={}", c))
+    }
+
+    fn authed(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let rb = rb.bearer_auth(&self.token);
+        match self.cookie_header() {
+            Some(cookie) => rb.header(reqwest::header::COOKIE, cookie),
+            None => rb,
+        }
     }
 
     /// Generic helper for GET requests to the Slack API.
@@ -51,9 +72,7 @@ impl SlackClient {
     ) -> Result<T, SlackError> {
         let url = format!("{}/{}", SLACK_API_BASE, method);
         let resp = self
-            .http
-            .get(&url)
-            .bearer_auth(&self.token)
+            .authed(self.http.get(&url))
             .query(params)
             .send()
             .await
@@ -82,9 +101,7 @@ impl SlackClient {
     ) -> Result<T, SlackError> {
         let url = format!("{}/{}", SLACK_API_BASE, method);
         let resp = self
-            .http
-            .post(&url)
-            .bearer_auth(&self.token)
+            .authed(self.http.post(&url))
             .json(body)
             .send()
             .await
@@ -113,9 +130,7 @@ impl SlackClient {
     ) -> Result<T, SlackError> {
         let url = format!("{}/{}", SLACK_API_BASE, method);
         let resp = self
-            .http
-            .post(&url)
-            .bearer_auth(&self.token)
+            .authed(self.http.post(&url))
             .form(params)
             .send()
             .await
@@ -566,9 +581,7 @@ impl SlackClient {
     /// Download a file from Slack (requires auth for url_private URLs).
     pub async fn download_file(&self, url: &str) -> Result<Vec<u8>, SlackError> {
         let resp = self
-            .http
-            .get(url)
-            .bearer_auth(&self.token)
+            .authed(self.http.get(url))
             .send()
             .await
             .map_err(|e| SlackError::Http(e.to_string()))?;
@@ -962,6 +975,54 @@ mod tests {
     fn test_slack_client_new() {
         let client = SlackClient::new("xoxp-test-token");
         assert_eq!(client.token, "xoxp-test-token");
+    }
+
+    #[test]
+    fn test_cookie_header_with_cookie() {
+        let client = SlackClient::with_cookie("xoxc-x", Some("xoxd-y"));
+        assert_eq!(client.cookie_header(), Some("d=xoxd-y".to_string()));
+    }
+
+    #[test]
+    fn test_cookie_header_without_cookie() {
+        let client = SlackClient::new("xoxc-x");
+        assert_eq!(client.cookie_header(), None);
+    }
+
+    #[test]
+    fn test_cookie_header_empty_cookie() {
+        let client = SlackClient::with_cookie("xoxc-x", Some(""));
+        assert_eq!(client.cookie_header(), None);
+    }
+
+    #[test]
+    fn test_cookie_header_not_reencoded() {
+        let client = SlackClient::with_cookie("xoxc-x", Some("xoxd-a%2Fb/c%3D"));
+        assert_eq!(client.cookie_header(), Some("d=xoxd-a%2Fb/c%3D".to_string()));
+    }
+
+    #[test]
+    fn test_authed_sets_bearer_and_cookie() {
+        let client = SlackClient::with_cookie("xoxc-x", Some("xoxd-y"));
+        let req = client
+            .authed(client.http.get("https://slack.com/api/auth.test"))
+            .build()
+            .unwrap();
+        let headers = req.headers();
+        assert_eq!(headers.get("authorization").unwrap(), "Bearer xoxc-x");
+        assert_eq!(headers.get("cookie").unwrap(), "d=xoxd-y");
+    }
+
+    #[test]
+    fn test_authed_without_cookie_omits_header() {
+        let client = SlackClient::new("xoxc-x");
+        let req = client
+            .authed(client.http.get("https://slack.com/api/auth.test"))
+            .build()
+            .unwrap();
+        let headers = req.headers();
+        assert_eq!(headers.get("authorization").unwrap(), "Bearer xoxc-x");
+        assert!(headers.get("cookie").is_none());
     }
 
     #[test]

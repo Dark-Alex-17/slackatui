@@ -3,9 +3,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 const KEYCHAIN_SERVICE: &str = "slackatui";
+
+/// The longest command line, excluding the trailing newline, that `security -i`
+/// reads as one command; longer input is split and executed as several commands.
+const KEYCHAIN_LINE_MAX: usize = 4095;
 
 /// Persisted tokens for a workspace.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -14,6 +18,8 @@ pub struct StoredTokens {
     pub bot_token: String,
     #[serde(default)]
     pub user_token: String,
+    #[serde(default)]
+    pub cookie: String,
     pub team_id: String,
     #[serde(default)]
     pub team_name: String,
@@ -107,25 +113,87 @@ pub fn store_tokens_keychain(tokens: &StoredTokens) -> Result<(), StoreError> {
     Ok(())
 }
 
-fn keychain_set(account: &str, data: &str) -> Result<(), StoreError> {
-    // Remove existing entry (ignore error if not found)
-    let _ = Command::new("security")
-        .args(["delete-generic-password", "-s", KEYCHAIN_SERVICE, "-a", account])
-        .output();
+/// Read credentials from `SLACK_TOKEN` and `SLACK_COOKIE`, bypassing the token store.
+/// Returns `None` when `SLACK_TOKEN` is unset or empty.
+pub fn tokens_from_env() -> Option<StoredTokens> {
+    tokens_from_env_values(
+        std::env::var("SLACK_TOKEN").ok(),
+        std::env::var("SLACK_COOKIE").ok(),
+    )
+}
 
-    let output = Command::new("security")
-        .args([
-            "add-generic-password",
-            "-s",
-            KEYCHAIN_SERVICE,
-            "-a",
-            account,
-            "-w",
-            data,
-        ])
-        .output()
+fn tokens_from_env_values(token: Option<String>, cookie: Option<String>) -> Option<StoredTokens> {
+    let token = token.map(|t| t.trim().to_string()).filter(|t| !t.is_empty())?;
+    Some(StoredTokens {
+        user_token: token,
+        cookie: cookie.map(|c| c.trim().to_string()).unwrap_or_default(),
+        ..Default::default()
+    })
+}
+
+fn hex_upper(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{:02X}", b)).collect()
+}
+
+/// The `security -i` command line that upserts `data` under `account`.
+/// The secret is hex-encoded (`-X`) so it never appears on a process argument list.
+fn keychain_add_command(account: &str, data: &str) -> Result<String, StoreError> {
+    // `security -i` tokenises the line on whitespace, so the account must not be
+    // able to smuggle in further arguments or commands.
+    let account_ok = !account.is_empty()
+        && account
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'));
+    if !account_ok {
+        return Err(StoreError::KeychainError(format!(
+            "invalid keychain account {:?}",
+            account
+        )));
+    }
+    let line = format!(
+        "add-generic-password -a {} -s {} -U -X {}\n",
+        account,
+        KEYCHAIN_SERVICE,
+        hex_upper(data.as_bytes())
+    );
+    let command_len = line.len() - 1;
+    if command_len > KEYCHAIN_LINE_MAX {
+        return Err(StoreError::KeychainError(format!(
+            "keychain payload too large ({} bytes; security -i accepts at most {} per command)",
+            command_len, KEYCHAIN_LINE_MAX
+        )));
+    }
+    Ok(line)
+}
+
+fn keychain_set(account: &str, data: &str) -> Result<(), StoreError> {
+    use std::io::Write;
+
+    let command = keychain_add_command(account, data)?;
+    let mut child = Command::new("security")
+        .arg("-i")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| StoreError::KeychainError(e.to_string()))?;
 
+    {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| StoreError::KeychainError("security stdin unavailable".to_string()))?;
+        stdin
+            .write_all(command.as_bytes())
+            .map_err(|e| StoreError::KeychainError(e.to_string()))?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|e| StoreError::KeychainError(e.to_string()))?;
+
+    // `security -i` exits with the status of the last command it ran, not 0 at EOF,
+    // so a rejected add-generic-password is visible here.
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(StoreError::KeychainError(format!(
@@ -280,6 +348,7 @@ mod tests {
         StoredTokens {
             bot_token: String::new(),
             user_token: "xoxp-test-token".to_string(),
+            cookie: String::new(),
             team_id: team_id.to_string(),
             team_name: team_name.to_string(),
             user_id: "U123".to_string(),
@@ -414,6 +483,104 @@ mod tests {
         let parsed: StoredTokens = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.team_id, "T1");
         assert_eq!(parsed.user_token, "xoxp-test-token");
+    }
+
+    #[test]
+    fn test_stored_tokens_cookie_roundtrip() {
+        let mut tokens = make_tokens("T1", "Test");
+        tokens.cookie = "xoxd-cookie".to_string();
+        let json = serde_json::to_string(&tokens).unwrap();
+        let parsed: StoredTokens = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.cookie, "xoxd-cookie");
+    }
+
+    #[test]
+    fn test_stored_tokens_legacy_without_cookie() {
+        let json = r#"{"team_id":"T1","user_token":"xoxp-a"}"#;
+        let parsed: StoredTokens = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.user_token, "xoxp-a");
+        assert_eq!(parsed.cookie, "");
+    }
+
+    #[test]
+    fn test_tokens_from_env_values_with_cookie() {
+        let tokens =
+            tokens_from_env_values(Some("xoxc-x".to_string()), Some("xoxd-y".to_string())).unwrap();
+        assert_eq!(tokens.user_token, "xoxc-x");
+        assert_eq!(tokens.cookie, "xoxd-y");
+        assert_eq!(tokens.team_id, "");
+    }
+
+    #[test]
+    fn test_tokens_from_env_values_without_cookie() {
+        let tokens = tokens_from_env_values(Some("xoxc-x".to_string()), None).unwrap();
+        assert_eq!(tokens.user_token, "xoxc-x");
+        assert_eq!(tokens.cookie, "");
+    }
+
+    #[test]
+    fn test_tokens_from_env_values_empty_token() {
+        assert!(tokens_from_env_values(Some(String::new()), Some("xoxd-y".to_string())).is_none());
+        assert!(tokens_from_env_values(Some("  ".to_string()), Some("xoxd-y".to_string())).is_none());
+    }
+
+    #[test]
+    fn test_tokens_from_env_values_trims_whitespace() {
+        let tokens =
+            tokens_from_env_values(Some("xoxc-x\n".to_string()), Some(" xoxd-y\n".to_string()))
+                .unwrap();
+        assert_eq!(tokens.user_token, "xoxc-x");
+        assert_eq!(tokens.cookie, "xoxd-y");
+    }
+
+    #[test]
+    fn test_tokens_from_env_values_missing_token() {
+        assert!(tokens_from_env_values(None, Some("xoxd-y".to_string())).is_none());
+        assert!(tokens_from_env_values(None, None).is_none());
+    }
+
+    #[test]
+    fn test_hex_upper() {
+        assert_eq!(hex_upper(b"ab"), "6162");
+        assert_eq!(hex_upper(b""), "");
+        assert_eq!(hex_upper(&[0x00, 0xff]), "00FF");
+    }
+
+    #[test]
+    fn test_keychain_add_command() {
+        let secret = "{\"a\":1}";
+        let cmd = keychain_add_command("T1", secret).unwrap();
+        assert_eq!(
+            cmd,
+            "add-generic-password -a T1 -s slackatui -U -X 7B2261223A317D\n"
+        );
+        assert!(!cmd.contains(secret));
+    }
+
+    #[test]
+    fn test_keychain_add_command_rejects_unsafe_account() {
+        assert!(keychain_add_command("T1 -w", "x").is_err());
+        assert!(keychain_add_command("T1\n", "x").is_err());
+        assert!(keychain_add_command("", "x").is_err());
+        assert!(keychain_add_command("default", "x").is_ok());
+    }
+
+    #[test]
+    fn test_keychain_add_command_line_length_boundary() {
+        let prefix = keychain_add_command("T1", "").unwrap();
+        let prefix_len = prefix.len() - 1;
+        assert_eq!(prefix_len, "add-generic-password -a T1 -s slackatui -U -X ".len());
+
+        // Hex encoding doubles the data length, so this is the largest payload
+        // whose command line still fits within KEYCHAIN_LINE_MAX.
+        let max_data_len = (KEYCHAIN_LINE_MAX - prefix_len) / 2;
+        let fits = "a".repeat(max_data_len);
+        let line = keychain_add_command("T1", &fits).unwrap();
+        assert_eq!(line.len() - 1, prefix_len + 2 * max_data_len);
+        assert!(line.len() - 1 <= KEYCHAIN_LINE_MAX);
+
+        let too_big = "a".repeat(max_data_len + 1);
+        assert!(keychain_add_command("T1", &too_big).is_err());
     }
 
     #[test]

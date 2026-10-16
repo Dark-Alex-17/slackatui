@@ -2,12 +2,15 @@
 //!
 //! Every case runs the real binary against a throwaway `HOME` and `TMPDIR`
 //! so the user's config and token store are never touched, and every case
-//! is guaranteed offline: browser-bound paths always pass `--browser` with
-//! a path that does not exist (so no browser is ever launched), and any
-//! argument shape that *could* reach the network is additionally fenced by
-//! routing all HTTP egress to a dead local proxy. Never add a case here that
-//! runs `login` without `--browser <nonexistent>` or that supplies a
-//! well-formed `--token` + `--cookie` pair without the proxy fence.
+//! is guaranteed offline: `Sandbox::run` always appends `--browser` with a
+//! path that does not exist (so no browser is ever launched, whatever the
+//! arguments parse to), and any argument shape that *could* reach the
+//! network is additionally fenced by routing all HTTP egress to a dead local
+//! proxy. `Sandbox::run_unfenced` exists only for cases that assert on the
+//! `--browser` value itself; it refuses argument lists that do not carry
+//! their own `--browser`. Never add a case here that runs `login` through a
+//! raw `Command`, or that supplies a well-formed `--token` + `--cookie` pair
+//! without the proxy fence.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -42,10 +45,33 @@ impl Sandbox {
         }
     }
 
+    /// Run `login` with `--browser <nonexistent>` appended after `args`.
+    ///
+    /// `--browser` is last-wins in the parser and a `--`-prefixed token is
+    /// never consumed as a flag value, so the appended fence holds for every
+    /// argument shape: either parsing fails first or `find_browser` is handed
+    /// a path that cannot exist.
     fn run(&self, args: &[&str]) -> Output {
+        let mut cmd = self.command();
+        cmd.args(args).arg("--browser").arg(NONEXISTENT_BROWSER);
+        cmd.output().expect("spawn slackatui")
+    }
+
+    /// Run `login` with exactly `args`, for cases that assert on the
+    /// `--browser` value itself. The caller must supply its own `--browser`.
+    fn run_unfenced(&self, args: &[&str]) -> Output {
+        assert!(
+            args.contains(&"--browser"),
+            "run_unfenced requires an explicit --browser so no real browser can launch: {args:?}"
+        );
+        let mut cmd = self.command();
+        cmd.args(args);
+        cmd.output().expect("spawn slackatui")
+    }
+
+    fn command(&self) -> Command {
         let mut cmd = Command::new(BIN);
         cmd.arg("login")
-            .args(args)
             .env_clear()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", self.home.path())
@@ -57,7 +83,7 @@ impl Sandbox {
             .env("https_proxy", DEAD_PROXY)
             .env("http_proxy", DEAD_PROXY)
             .env("ALL_PROXY", DEAD_PROXY);
-        cmd.output().expect("spawn slackatui")
+        cmd
     }
 
     /// Files under the sandbox HOME that look like a token-store write.
@@ -142,10 +168,11 @@ fn cookie_alone_without_workspace_is_rejected() {
 
 #[test]
 fn cookie_alone_is_rejected_before_browser_lookup() {
-    // A bogus --browser is present, but LoginArgs must be consulted first:
-    // the --cookie-alone message wins and the no-browser message never appears.
+    // The sandbox fence supplies a bogus --browser, but LoginArgs must be
+    // consulted first: the --cookie-alone message wins and the no-browser
+    // message never appears.
     let sb = Sandbox::new();
-    let o = sb.run(&["--cookie", "xoxd-x", "--browser", NONEXISTENT_BROWSER]);
+    let o = sb.run(&["--cookie", "xoxd-x"]);
     assert_exit_1(&o);
     let err = stderr(&o);
     assert!(err.contains(COOKIE_ALONE_MSG), "stderr:\n{err}");
@@ -161,7 +188,7 @@ fn cookie_alone_is_rejected_before_browser_lookup() {
 #[test]
 fn nonexistent_browser_override_prints_no_browser_message() {
     let sb = Sandbox::new();
-    let o = sb.run(&["--browser", NONEXISTENT_BROWSER]);
+    let o = sb.run_unfenced(&["--browser", NONEXISTENT_BROWSER]);
     assert_exit_1(&o);
     let err = stderr(&o);
     assert!(
@@ -176,7 +203,7 @@ fn nonexistent_browser_override_with_workspace_and_timeout() {
     // Positional workspace (URL form) and --timeout are accepted; still no
     // fallback to auto-discovery when the override matches nothing.
     let sb = Sandbox::new();
-    let o = sb.run(&[
+    let o = sb.run_unfenced(&[
         "https://myteam.slack.com/",
         "--timeout",
         "30",
@@ -195,7 +222,7 @@ fn nonexistent_browser_override_with_workspace_and_timeout() {
 #[test]
 fn empty_browser_override_does_not_fall_back_to_discovery() {
     let sb = Sandbox::new();
-    let o = sb.run(&["--browser", ""]);
+    let o = sb.run_unfenced(&["--browser", ""]);
     assert_exit_1(&o);
     let err = stderr(&o);
     assert!(
@@ -228,7 +255,7 @@ fn unknown_flag_exits_1_with_usage() {
 #[test]
 fn unknown_flag_does_not_reach_browser_lookup() {
     let sb = Sandbox::new();
-    let o = sb.run(&["--bogus", "--browser", NONEXISTENT_BROWSER]);
+    let o = sb.run(&["--bogus"]);
     assert_exit_1(&o);
     let err = stderr(&o);
     assert!(err.contains(USAGE), "stderr:\n{err}");
@@ -259,7 +286,7 @@ fn whitespace_only_token_is_trimmed_and_rejected() {
 #[test]
 fn empty_token_is_rejected_before_browser_lookup() {
     let sb = Sandbox::new();
-    let o = sb.run(&["--token", "", "--browser", NONEXISTENT_BROWSER]);
+    let o = sb.run(&["--token", ""]);
     assert_exit_1(&o);
     let err = stderr(&o);
     assert!(
@@ -299,6 +326,9 @@ fn empty_cookie_with_token_is_rejected_before_store() {
 
 #[test]
 fn flag_missing_value_exits_1_with_usage() {
+    // The fence appended by Sandbox::run starts with `--`, which the parser
+    // never accepts as a flag value, so each trailing flag is still missing
+    // its value.
     for args in [
         &["--token"][..],
         &["myteam", "--cookie"][..],
@@ -321,7 +351,7 @@ fn flag_missing_value_exits_1_with_usage() {
 #[test]
 fn non_numeric_timeout_exits_1_without_panic() {
     let sb = Sandbox::new();
-    let o = sb.run(&["--timeout", "abc", "--browser", NONEXISTENT_BROWSER]);
+    let o = sb.run(&["--timeout", "abc"]);
     assert_exit_1(&o);
     let err = stderr(&o);
     assert!(err.contains("--timeout"), "stderr:\n{err}");
@@ -330,11 +360,47 @@ fn non_numeric_timeout_exits_1_without_panic() {
 }
 
 #[test]
+fn out_of_range_timeout_exits_1_without_panic() {
+    // Overflow and negative values take the same rejection path as a
+    // non-numeric value: a named --timeout error, usage, no browser lookup.
+    for bad in ["99999999999999999999999", "-5"] {
+        let sb = Sandbox::new();
+        let o = sb.run(&["--timeout", bad]);
+        assert_exit_1(&o);
+        let err = stderr(&o);
+        assert!(err.contains("--timeout"), "timeout {bad:?} stderr:\n{err}");
+        assert!(err.contains(USAGE), "timeout {bad:?} stderr:\n{err}");
+        assert!(!err.contains("panicked"), "timeout {bad:?} stderr:\n{err}");
+        assert!(
+            !err.contains("No Chromium-family browser"),
+            "timeout {bad:?} stderr:\n{err}"
+        );
+        assert_no_store_write(&sb);
+    }
+}
+
+#[test]
+fn whitespace_only_browser_override_is_rejected_as_empty() {
+    // The writer trims its inputs; a blank --browser is the empty case and
+    // must not silently fall back to auto-discovery.
+    let sb = Sandbox::new();
+    let o = sb.run_unfenced(&["--browser", "   "]);
+    assert_exit_1(&o);
+    let err = stderr(&o);
+    assert!(
+        err.contains("--browser must not be empty"),
+        "stderr:\n{err}"
+    );
+    assert!(!err.contains(NO_BROWSER_MSG), "stderr:\n{err}");
+    assert_no_store_write(&sb);
+}
+
+#[test]
 fn positional_workspace_after_flags_is_accepted() {
     // `login [workspace]` is a single optional positional; it must be
     // accepted regardless of where it sits relative to the flags.
     let sb = Sandbox::new();
-    let o = sb.run(&["--browser", NONEXISTENT_BROWSER, "myteam"]);
+    let o = sb.run(&["--timeout", "30", "myteam"]);
     assert_exit_1(&o);
     let err = stderr(&o);
     assert!(err.contains(NO_BROWSER_MSG), "stderr:\n{err}");
@@ -345,7 +411,7 @@ fn positional_workspace_after_flags_is_accepted() {
 #[test]
 fn workspace_with_slack_com_suffix_is_accepted() {
     let sb = Sandbox::new();
-    let o = sb.run(&["myteam.slack.com", "--browser", NONEXISTENT_BROWSER]);
+    let o = sb.run(&["myteam.slack.com"]);
     assert_exit_1(&o);
     let err = stderr(&o);
     assert!(err.contains(NO_BROWSER_MSG), "stderr:\n{err}");
@@ -356,7 +422,7 @@ fn workspace_with_slack_com_suffix_is_accepted() {
 #[test]
 fn second_positional_is_rejected_with_usage_before_browser_lookup() {
     let sb = Sandbox::new();
-    let o = sb.run(&["myteam", "other", "--browser", NONEXISTENT_BROWSER]);
+    let o = sb.run(&["myteam", "other"]);
     assert_exit_1(&o);
     let err = stderr(&o);
     assert!(
@@ -381,13 +447,7 @@ fn second_positional_is_rejected_with_usage_before_browser_lookup() {
 #[test]
 fn cookie_with_workspace_does_not_reach_browser_lookup() {
     let sb = Sandbox::new();
-    let o = sb.run(&[
-        "myteam",
-        "--cookie",
-        "xoxd-x",
-        "--browser",
-        NONEXISTENT_BROWSER,
-    ]);
+    let o = sb.run(&["myteam", "--cookie", "xoxd-x"]);
     assert_exit_1(&o);
     let err = stderr(&o);
     assert!(
@@ -404,7 +464,7 @@ fn cookie_with_workspace_does_not_reach_browser_lookup() {
 #[test]
 fn token_only_does_not_reach_browser_lookup() {
     let sb = Sandbox::new();
-    let o = sb.run(&["--token", "xoxc-x", "--browser", NONEXISTENT_BROWSER]);
+    let o = sb.run(&["--token", "xoxc-x"]);
     assert_exit_1(&o);
     let err = stderr(&o);
     assert!(
@@ -425,14 +485,7 @@ fn token_and_cookie_with_failed_auth_test_exits_1_without_store_write() {
     // Offline analogue of the `--token xoxc-bad --cookie xoxd-bad` criterion:
     // auth.test cannot succeed (dead proxy), so nothing may reach the store.
     let sb = Sandbox::new();
-    let o = sb.run(&[
-        "--token",
-        "xoxc-bad",
-        "--cookie",
-        "xoxd-bad",
-        "--browser",
-        NONEXISTENT_BROWSER,
-    ]);
+    let o = sb.run(&["--token", "xoxc-bad", "--cookie", "xoxd-bad"]);
     assert_exit_1(&o);
     let err = stderr(&o);
     assert!(
@@ -445,6 +498,74 @@ fn token_and_cookie_with_failed_auth_test_exits_1_without_store_write() {
         "stdout:\n{}",
         stdout(&o)
     );
+    assert_no_store_write(&sb);
+}
+
+// --- trimming: padded values are accepted, not rejected as empty ----------
+//
+// The AC says the writer trims the supplied cookie and token. The negative
+// half (whitespace-only -> empty -> rejected) is pinned above; these pin the
+// positive half: a value with surrounding whitespace is a *valid* value and
+// must take the normal auth path (which fails offline behind the dead
+// proxy), never the empty-value or usage rejection.
+
+#[test]
+fn whitespace_padded_token_and_cookie_are_accepted_and_reach_auth_test() {
+    let sb = Sandbox::new();
+    let o = sb.run(&["--token", "  xoxc-x\t", "--cookie", " xoxd-x  "]);
+    assert_exit_1(&o);
+    let err = stderr(&o);
+    assert!(!err.contains(USAGE), "padded values must parse:\n{err}");
+    assert!(!err.contains("must not be empty"), "stderr:\n{err}");
+    assert!(
+        !err.contains("No Chromium-family browser"),
+        "stderr:\n{err}"
+    );
+    assert!(
+        err.contains("Login failed"),
+        "should reach auth.test and report its failure:\n{err}"
+    );
+    assert!(!err.contains("panicked"), "stderr:\n{err}");
+    assert_no_store_write(&sb);
+}
+
+#[test]
+fn whitespace_padded_token_only_is_accepted_and_reaches_auth_test() {
+    let sb = Sandbox::new();
+    let o = sb.run(&["--token", " xoxc-x "]);
+    assert_exit_1(&o);
+    let err = stderr(&o);
+    assert!(!err.contains(USAGE), "padded token must parse:\n{err}");
+    assert!(!err.contains("must not be empty"), "stderr:\n{err}");
+    assert!(
+        !err.contains("No Chromium-family browser"),
+        "stderr:\n{err}"
+    );
+    assert!(err.contains("Login failed"), "stderr:\n{err}");
+    assert_no_store_write(&sb);
+}
+
+#[test]
+fn whitespace_padded_cookie_with_workspace_is_accepted_and_targets_workspace() {
+    // Cookie-only login resolves the workspace to its Slack host; the padded
+    // cookie is a valid value and the positional workspace must be what the
+    // (offline, fenced) request targets.
+    let sb = Sandbox::new();
+    let o = sb.run(&["myteam", "--cookie", "  xoxd-x "]);
+    assert_exit_1(&o);
+    let err = stderr(&o);
+    assert!(!err.contains(USAGE), "padded cookie must parse:\n{err}");
+    assert!(!err.contains("must not be empty"), "stderr:\n{err}");
+    assert!(!err.contains(COOKIE_ALONE_MSG), "stderr:\n{err}");
+    assert!(
+        !err.contains("No Chromium-family browser"),
+        "stderr:\n{err}"
+    );
+    assert!(
+        err.contains("myteam.slack.com"),
+        "cookie flow should target the given workspace host:\n{err}"
+    );
+    assert!(!err.contains("panicked"), "stderr:\n{err}");
     assert_no_store_write(&sb);
 }
 
